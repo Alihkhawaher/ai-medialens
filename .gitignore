@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Bundled binaries (large)
+bin/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS junk
+Thumbs.db
+desktop.ini
