@@ -40,7 +40,10 @@ python openrouter_media.py video.mp4 -p "Transcribe all spoken Arabic word-for-w
 python openrouter_media.py video.mp4 -p "What happens here?" --start 5 --end 20
 
 # Different model / explicit key
-python openrouter_media.py doc.pdf -p "Summarize" -m google/gemini-2.0-flash-001 -k sk-or-v1-...
+python openrouter_media.py doc.pdf -p "Summarize" -m z-ai/glm-5.3-flash -k sk-or-v1-...
+
+# Scanned PDF -> real OCR (billed per page by OpenRouter)
+python openrouter_media.py scan.pdf -p "Extract all text" --pdf-engine mistral-ocr
 
 # Find models that accept video input, with prices
 python openrouter_media.py --list-models video
@@ -83,9 +86,35 @@ native range parameter). ffmpeg is resolved in this order:
 Note: trimming uses `-c copy` (fast, but cuts at keyframes; exact cuts would
 require re-encoding).
 
+## Models
+
+Default: **`qwen/qwen3.7-flash`** ($0.03/M in, $0.13/M out) — currently the
+cheapest OpenRouter model with full video input support.
+
+Other good video-capable options (verify current prices via
+`--list-models video`):
+
+| Model | In /M | Out /M |
+|---|---|---|
+| `qwen/qwen3.7-flash` (default) | $0.03 | $0.13 |
+| `z-ai/glm-5.3-flash` | $0.075 | $0.25 |
+| `qwen/qwen3.8-27b` | $0.425 | $2.55 |
+
+Any OpenRouter model slug works via `-m` / `model=` — including newer
+releases as they appear.
+
+## PDF parsing engines
+
+PDFs are parsed server-side by OpenRouter before reaching the model:
+
+| Engine | Behavior | Cost |
+|---|---|---|
+| *(default)* | Text extraction from embedded text layer | Free |
+| `--pdf-engine mistral-ocr` | **Real OCR** over page images — required for scanned/image-only PDFs | Billed per page |
+| `--pdf-engine native` | Forward raw PDF to models with native file input | Free |
+
 ## Notes
 
 - Large files are base64-encoded in-memory - very large videos may hit
   provider upload limits.
-- Default model: `google/gemini-2.0-flash-001`; override with `-m`.
 - Secrets are safe: `.env` is gitignored and never committed.

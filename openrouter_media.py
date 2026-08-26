@@ -39,7 +39,14 @@ import zipfile
 
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 MODELS_URL = 'https://openrouter.ai/api/v1/models'
-DEFAULT_MODEL = 'google/gemini-2.0-flash-001'
+DEFAULT_MODEL = 'qwen/qwen3.7-flash'
+
+# Server-side PDF parsing engines offered by OpenRouter's file-parser plugin.
+# - cloudflare-ai : default text extraction (free; fails on scanned PDFs)
+# - mistral-ocr   : real OCR over page images — reads scanned PDFs
+#                   (billed per page by OpenRouter)
+# - native        : forward raw PDF to models with native file input
+PDF_ENGINES = ('cloudflare-ai', 'mistral-ocr', 'native')
 
 FFMPEG_URL = ('https://www.gyan.dev/ffmpeg/builds/'
               'ffmpeg-release-essentials.zip')
@@ -204,9 +211,18 @@ def build_content_part(path):
                      f"{sorted(SUPPORTED_EXTS)}")
 
 
-def build_payload(path, prompt, model=DEFAULT_MODEL):
-    """Build the OpenRouter chat-completions request payload."""
-    return {
+def build_payload(path, prompt, model=DEFAULT_MODEL, pdf_engine=None):
+    """Build the OpenRouter chat-completions request payload.
+
+    Args:
+        pdf_engine: Optional PDF parsing engine for OpenRouter's
+                    file-parser plugin. One of PDF_ENGINES, or None to
+                    use OpenRouter's own default.
+    """
+    if pdf_engine is not None and pdf_engine not in PDF_ENGINES:
+        raise ValueError(f"Invalid pdf_engine '{pdf_engine}'. "
+                         f"Choose from: {PDF_ENGINES}")
+    payload = {
         "model": model,
         "messages": [{
             "role": "user",
@@ -216,10 +232,14 @@ def build_payload(path, prompt, model=DEFAULT_MODEL):
             ]
         }]
     }
+    if pdf_engine:
+        payload["plugins"] = [{"id": "file-parser",
+                               "pdf": {"engine": pdf_engine}}]
+    return payload
 
 
 def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
-            raw=False, start=None, end=None):
+            raw=False, start=None, end=None, pdf_engine=None):
     """Send a media file + prompt to OpenRouter and return the analysis.
 
     Args:
@@ -230,6 +250,8 @@ def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
         raw:    If True, return full API response dict instead of text.
         start:  Optional trim start ("30", "01:10", "00:01:10").
         end:    Optional trim end (same format).
+        pdf_engine: Optional PDF parsing engine (see PDF_ENGINES). Use
+                    'mistral-ocr' for scanned/image-only PDFs.
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f'File not found: {path}')
@@ -240,7 +262,8 @@ def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
     trimmed = None
     try:
         trimmed = trim_media(path, start, end)
-        payload = build_payload(trimmed, prompt, model)
+        payload = build_payload(trimmed, prompt, model,
+                                pdf_engine=pdf_engine)
         req = urllib.request.Request(
             API_URL,
             data=json.dumps(payload).encode(),
@@ -356,7 +379,8 @@ def mcp_run():
 
     @mcp.tool()
     def analyze_media(path: str, prompt: str, model: str = DEFAULT_MODEL,
-                      start: str = "", end: str = "") -> str:
+                      start: str = "", end: str = "",
+                      pdf_engine: str = "") -> str:
         """Analyze a video/audio/PDF/image file via OpenRouter.
 
         Args:
@@ -366,12 +390,17 @@ def mcp_run():
             start: Optional trim start time ("30", "01:10", "00:01:10").
             end: Optional trim end time (same format). Requires ffmpeg
                  (auto-downloaded on first use on Windows).
+            pdf_engine: For PDFs only. Use 'mistral-ocr' for scanned/
+                image-only PDFs (real OCR, billed per page). Options:
+                cloudflare-ai | mistral-ocr | native. Empty = default parser.
         """
         kwargs = {}
         if start:
             kwargs['start'] = start
         if end:
             kwargs['end'] = end
+        if pdf_engine:
+            kwargs['pdf_engine'] = pdf_engine
         return analyze(path, prompt, model=model, **kwargs)
 
     mcp.run()
@@ -396,6 +425,10 @@ def main(argv=None):
                          '(e.g. 30, 01:10, 00:01:10).')
     ap.add_argument('--end', default=None,
                     help='Trim end time (same format as --start).')
+    ap.add_argument('--pdf-engine', default=None, choices=PDF_ENGINES,
+                    help="PDF parsing engine (OpenRouter file-parser "
+                         "plugin). 'mistral-ocr' reads scanned/image-only "
+                         "PDFs via real OCR (billed per page).")
     ap.add_argument('--list-models', nargs='?', const='all',
                     metavar='MODALITY',
                     help="List OpenRouter models, optionally filtered by "
@@ -428,7 +461,8 @@ def main(argv=None):
     try:
         if args.dry_run:
             try:
-                payload = build_payload(trimmed, args.prompt, args.model)
+                payload = build_payload(trimmed, args.prompt, args.model,
+                                        pdf_engine=args.pdf_engine)
             except (FileNotFoundError, ValueError) as e:
                 sys.exit(str(e))
             part = payload['messages'][0]['content'][0]
@@ -443,7 +477,8 @@ def main(argv=None):
             try:
                 print(analyze(args.file, args.prompt, args.model,
                               key=args.key,
-                              start=args.start, end=args.end))
+                              start=args.start, end=args.end,
+                              pdf_engine=args.pdf_engine))
             except (RuntimeError, FileNotFoundError) as e:
                 sys.exit(str(e))
     finally:
