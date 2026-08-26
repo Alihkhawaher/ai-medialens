@@ -38,8 +38,10 @@ import urllib.request
 import zipfile
 
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+STT_URL = 'https://openrouter.ai/api/v1/audio/transcriptions'
 MODELS_URL = 'https://openrouter.ai/api/v1/models'
 DEFAULT_MODEL = 'qwen/qwen3.7-flash'
+DEFAULT_STT_MODEL = 'openai/whisper-large-v3-turbo'
 
 # Server-side PDF parsing engines offered by OpenRouter's file-parser plugin.
 # - cloudflare-ai : default text extraction (free; fails on scanned PDFs)
@@ -335,6 +337,157 @@ def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
             os.unlink(trimmed)
 
 
+# ----------------------------------------------------------------- STT ----
+
+def _run_ffmpeg(args):
+    """Run an ffmpeg command, raising RuntimeError with stderr on failure."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        ffmpeg = download_ffmpeg()
+    proc = subprocess.run([ffmpeg, '-y', '-loglevel', 'error'] + args,
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed: "
+                           + proc.stderr.decode(errors='replace')[:500])
+
+
+def make_stt_chunks(path, chunk_sec=360):
+    """Convert any audio/video file into STT-ready Opus chunks.
+
+    Hard-won lessons from VidChatBox's YouTube→subtitles pipeline:
+      - OpenRouter STT has a ~60s upstream timeout -> chunk long media
+      - Opus 32kbps/16kHz/mono is 8x smaller than WAV and universally
+        accepted by OpenRouter STT providers
+      - ffmpeg's segment muxer omits the Ogg EOS page on the last chunk;
+        OpenRouter's parser rejects streams without EOS -> re-mux every
+        chunk with -c copy to add it (fixes 500 errors)
+    Returns list of temp chunk paths (caller cleans up).
+    """
+    tmpdir = tempfile.mkdtemp(prefix='aimedialens_stt_')
+    pattern = os.path.join(tmpdir, 'chunk_%03d.opus')
+    # -vn strips video tracks so video files work directly
+    _run_ffmpeg(['-i', path, '-vn', '-ar', '16000', '-ac', '1',
+                 '-c:a', 'libopus', '-b:a', '32k', '-application', 'voip',
+                 '-f', 'segment', '-segment_time', str(chunk_sec),
+                 '-reset_timestamps', '1', pattern])
+
+    chunks = sorted(
+        os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
+        if f.startswith('chunk_') and f.endswith('.opus'))
+    if not chunks:
+        raise RuntimeError("ffmpeg produced no audio chunks "
+                           "(no audio track?)")
+
+    fixed = []
+    for i, c in enumerate(chunks):
+        out = c.replace('chunk_', 'fixed_')
+        try:
+            _run_ffmpeg(['-i', c, '-c', 'copy', out])  # adds missing EOS
+            fixed.append(out)
+            os.unlink(c)
+        except RuntimeError:
+            fixed.append(c)  # most STT APIs tolerate missing EOS
+            if os.path.isfile(out):
+                os.unlink(out)
+    return fixed
+
+
+def cleanup_chunks(chunks):
+    """Remove STT chunk temp files and their directory."""
+    if not chunks:
+        return
+    d = os.path.dirname(chunks[0])
+    for c in chunks:
+        if os.path.isfile(c):
+            os.unlink(c)
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
+
+
+def _write_srt(segments, offset=0.0):
+    """Format verbose_json segments as SRT subtitle text."""
+    def ts(t):
+        t += offset
+        h, rem = divmod(t, 3600)
+        m, s = divmod(rem, 60)
+        ms = int(round((s - int(s)) * 1000))
+        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        lines += [str(i),
+                  f"{ts(seg.get('start', 0))} --> {ts(seg.get('end', 0))}",
+                  (seg.get('text') or '').strip(), ""]
+    return "\n".join(lines)
+
+
+def transcribe(path, model=DEFAULT_STT_MODEL, key=None, language=None,
+               srt=False, timeout=300):
+    """Speech-to-text via OpenRouter's dedicated transcriptions endpoint.
+
+    Works on audio AND video files (audio track is extracted locally via
+    ffmpeg). Long media is auto-chunked into 6-minute Opus segments.
+
+    Args:
+        path:     Path to an audio or video file.
+        model:    OpenRouter STT model (e.g. openai/whisper-large-v3-turbo,
+                  openai/gpt-4o-transcribe, microsoft/mai-transcribe-1.5).
+                  Note: whisper-large-v3 does NOT tolerate sped-up audio.
+        language: ISO code hint (e.g. 'ar', 'en'). Improves accuracy.
+        srt:      If True, return SRT-formatted subtitles with timestamps
+                  (uses verbose_json segment granularity).
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'File not found: {path}')
+    key = get_key(key)
+    if not key:
+        raise RuntimeError(KEY_ERROR)
+
+    chunks = make_stt_chunks(path)
+    texts, segments = [], []
+    try:
+        for i, chunk in enumerate(chunks):
+            body = {"model": model,
+                    "input_audio": {
+                        "data": b64_of(chunk), "format": "opus"}}
+            if language:
+                body["language"] = language
+            if srt:
+                body["response_format"] = "verbose_json"
+                body["timestamp_granularities"] = ["segment"]
+
+            req = urllib.request.Request(
+                STT_URL,
+                data=json.dumps(body).encode(),
+                headers={'Authorization': f'Bearer {key}',
+                         'Content-Type': 'application/json'})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    result = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors='replace')[:300]
+                hints = {402: "OpenRouter account needs credits.",
+                         413: "Chunk too large for this model.",
+                         422: "Audio format rejected by provider.",
+                         502: "Transcription timed out."}
+                hint = hints.get(e.code, "")
+                raise RuntimeError(f"STT HTTP {e.code} on chunk {i+1}: "
+                                   f"{detail}\n{hint}".rstrip())
+
+            texts.append(result.get('text') or '')
+            if srt and result.get('segments'):
+                offset = i * 360  # chunk length in seconds
+                segments.extend(result['segments'])
+    finally:
+        cleanup_chunks(chunks)
+
+    if srt:
+        return _write_srt(segments)
+    return "\n".join(t for t in texts if t)
+
+
 # -------------------------------------------------------- list models ----
 
 def list_models(modality=None):
@@ -458,6 +611,25 @@ def mcp_run():
             kwargs['pdf_engine'] = pdf_engine
         return analyze(path, prompt, model=model, **kwargs)
 
+    @mcp.tool()
+    def transcribe_audio(path: str, language: str = "",
+                         model: str = DEFAULT_STT_MODEL,
+                         srt: bool = False) -> str:
+        """Transcribe speech in an audio/video file to text (STT).
+
+        Uses OpenRouter's Whisper-class transcription endpoint. Works on
+        video files too (audio track extracted locally). Long media is
+        auto-chunked. Set srt=true for timestamped SRT subtitles.
+
+        Args:
+            path: Absolute path to an audio or video file.
+            language: Optional language hint ('ar', 'en', ...).
+            model: STT model slug (default whisper-large-v3-turbo).
+            srt: Return SRT subtitles with timestamps instead of plain text.
+        """
+        return transcribe(path, model=model, language=language or None,
+                          srt=srt)
+
     mcp.run()
 
 
@@ -484,6 +656,17 @@ def main(argv=None):
                     help="PDF parsing engine (OpenRouter file-parser "
                          "plugin). 'mistral-ocr' reads scanned/image-only "
                          "PDFs via real OCR (billed per page).")
+    ap.add_argument('--stt', action='store_true',
+                    help='Speech-to-text mode: transcribe audio/video to '
+                         'text via OpenRouter STT (works on video files too '
+                         '- audio track is extracted). Use -p/-m analysis '
+                         'options are ignored in this mode.')
+    ap.add_argument('--language', default=None,
+                    help="Language hint for STT (e.g. 'ar', 'en')")
+    ap.add_argument('--srt', action='store_true',
+                    help='With --stt: output SRT subtitles with timestamps')
+    ap.add_argument('--stt-model', default=DEFAULT_STT_MODEL,
+                    help=f'STT model (default: {DEFAULT_STT_MODEL})')
     ap.add_argument('--list-models', nargs='?', const='all',
                     metavar='MODALITY',
                     help="List OpenRouter models, optionally filtered by "
@@ -505,6 +688,15 @@ def main(argv=None):
     if not args.file:
         ap.error('the following arguments are required: file '
                  '(or use "setup" / "--list-models")')
+
+    if args.stt:
+        try:
+            print(transcribe(args.file, model=args.stt_model, key=args.key,
+                             language=args.language, srt=args.srt))
+        except (RuntimeError, FileNotFoundError) as e:
+            sys.exit(str(e))
+        return
+
     if not args.prompt:
         ap.error('-p/--prompt is required')
 
@@ -542,6 +734,13 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    # Force UTF-8 output so non-ASCII results (e.g. Arabic transcripts)
+    # survive console pipes and file redirects on Windows.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
     # No arguments -> MCP stdio server mode; with args -> CLI mode.
     if len(sys.argv) > 1:
         main()

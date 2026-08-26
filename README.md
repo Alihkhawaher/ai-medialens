@@ -45,6 +45,12 @@ python openrouter_media.py doc.pdf -p "Summarize" -m z-ai/glm-5.3-flash -k sk-or
 # Scanned PDF -> real OCR (billed per page by OpenRouter)
 python openrouter_media.py scan.pdf -p "Extract all text" --pdf-engine mistral-ocr
 
+# Speech-to-text (works on video files too - audio track extracted locally)
+python openrouter_media.py lecture.mp4 --stt --language ar
+
+# SRT subtitles with timestamps
+python openrouter_media.py lecture.mp4 --stt --srt > lecture.srt
+
 # Find models that accept video input, with prices
 python openrouter_media.py --list-models video
 
@@ -53,10 +59,13 @@ python openrouter_media.py video.mp4 -p "test" --dry-run
 ```
 
 ### MCP (from Cline)
-Cline calls the tool natively:
+Cline calls the tools natively:
 ```
 use_mcp_tool: server=ai-medialens, tool=analyze_media
 arguments: { "path": "...", "prompt": "...", "start": "5", "end": "20" }
+
+use_mcp_tool: server=ai-medialens, tool=transcribe_audio
+arguments: { "path": "...", "language": "ar", "srt": false }
 ```
 
 ### As a Python module
@@ -116,6 +125,25 @@ PDFs are parsed either **locally** or server-side by OpenRouter:
 
 `local` is recommended: it never hits OpenRouter's parser rate limits and
 handles both digital and scanned PDFs at zero extra cost.
+
+## Speech-to-text (STT)
+
+Uses OpenRouter's dedicated `/audio/transcriptions` endpoint (Whisper-class
+models). Default model: **`openai/whisper-large-v3-turbo`**. Other options:
+`openai/gpt-4o-transcribe`, `openai/gpt-4o-mini-transcribe`,
+`microsoft/mai-transcribe-1.5`, `openai/whisper-large-v3`.
+
+Pipeline hardening (lessons from a production YouTube→subtitles system):
+- Any audio/video input → ffmpeg converts to **Opus 32kbps/16kHz/mono**
+  (8× smaller than WAV, accepted by all providers); video tracks stripped
+- Long media auto-split into **6-minute chunks** (OpenRouter has a ~60s
+  upstream timeout per request)
+- Each chunk re-muxed to add the missing Ogg EOS page (ffmpeg's segment
+  muxer omits it; OpenRouter's parser rejects streams without it)
+- `--srt` returns timestamped SRT subtitles via `verbose_json` segments,
+  correctly offset across chunks
+- Note: `whisper-large-v3` produces garbled output on sped-up audio;
+  `mai-transcribe-1.5` tolerates it
 
 ## Notes
 
