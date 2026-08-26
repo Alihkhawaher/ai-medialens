@@ -1,13 +1,15 @@
-"""openrouter_media.py — Analyze video/audio/PDF/image via OpenRouter.
+"""AI-MediaLens — Analyze video/audio/PDF/image via OpenRouter.
 
 Fills the gap of what Cline can't read: video, audio, and PDF files.
 Sends files directly to OpenRouter (/api/v1/chat/completions) which routes
 them to multimodal models (and parses PDFs for any model).
 
-Dual-mode:
-  CLI : python openrouter_media.py <file> -p "prompt" [--start T] [--end T]
-  MCP : launched with NO arguments -> stdio MCP server exposing
-        the tool  analyze_media(path, prompt, model?, start?, end?)
+Modes:
+  CLI  : python openrouter_media.py <file> -p "prompt" [--start T] [--end T]
+  Setup: python openrouter_media.py setup        # configure key + Cline MCP
+  Models: python openrouter_media.py --list-models [video|audio]
+  MCP  : launched with NO arguments -> stdio MCP server exposing
+         the tool  analyze_media(path, prompt, model?, start?, end?)
 
 Supported inputs (auto-detected by extension):
   Video : .mp4 .mpeg .mov .webm          -> video_url  (base64 data URL)
@@ -16,13 +18,14 @@ Supported inputs (auto-detected by extension):
   Image : .jpg .jpeg .png .gif .webp     -> image_url  (base64 data URL)
 
 API key resolution order:
-  1. OR_KEY environment variable
-  2. .env file next to this script (OR_KEY=sk-or-...)
+  1. --key flag          2. OR_KEY env var        3. OPENROUTER_API_KEY env var
+  4. .env file next to this script
 
 Requires: pip install mcp   (only needed for MCP mode)
 """
 import argparse
 import base64
+import io
 import json
 import mimetypes
 import os
@@ -32,9 +35,17 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
-DEFAULT_MODEL = 'z-ai/glm-5.3-flash'
+MODELS_URL = 'https://openrouter.ai/api/v1/models'
+DEFAULT_MODEL = 'google/gemini-2.0-flash-001'
+
+FFMPEG_URL = ('https://www.gyan.dev/ffmpeg/builds/'
+              'ffmpeg-release-essentials.zip')
+CACHE_DIR = os.path.join(os.environ.get('LOCALAPPDATA',
+                                        os.path.expanduser('~')),
+                         'ai-medialens', 'bin')
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -68,18 +79,91 @@ def load_env():
 load_env()
 
 
-def get_key():
-    return os.environ.get('OR_KEY')
+def get_key(explicit=None):
+    """Resolve API key: explicit flag > OR_KEY > OPENROUTER_API_KEY."""
+    return (explicit or os.environ.get('OR_KEY')
+            or os.environ.get('OPENROUTER_API_KEY'))
+
+
+KEY_ERROR = ("No API key found.\n"
+             "  Get one free at https://openrouter.ai/keys then either:\n"
+             "  - run:  python openrouter_media.py setup\n"
+             "  - or set OR_KEY / OPENROUTER_API_KEY environment variable")
 
 
 # -------------------------------------------------------------- ffmpeg ----
 
 def find_ffmpeg():
-    """Prefer bundled bin/ffmpeg.exe, fall back to PATH."""
+    """Locate ffmpeg: bundled bin/ -> PATH -> auto-download cache dir."""
     bundled = os.path.join(SCRIPT_DIR, 'bin', 'ffmpeg.exe')
     if os.path.isfile(bundled):
         return bundled
+    cached = os.path.join(CACHE_DIR, 'ffmpeg.exe')
+    if os.path.isfile(cached):
+        return cached
     return shutil.which('ffmpeg')
+
+
+def download_ffmpeg():
+    """Download a static ffmpeg build once into the user cache dir."""
+    target = os.path.join(CACHE_DIR, 'ffmpeg.exe')
+    if os.path.isfile(target):
+        return target
+    if sys.platform != 'win32':
+        raise RuntimeError("Automatic ffmpeg download supports Windows only. "
+                           "Install ffmpeg via your package manager.")
+    print(f"[setup] Downloading ffmpeg (~80 MB, one time) ...", file=sys.stderr)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp_zip = os.path.join(CACHE_DIR, 'ffmpeg.zip')
+    try:
+        urllib.request.urlretrieve(FFMPEG_URL, tmp_zip)
+        with zipfile.ZipFile(tmp_zip) as z:
+            member = next(n for n in z.namelist()
+                          if n.endswith('/bin/ffmpeg.exe'))
+            with z.open(member) as src, open(target, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+    finally:
+        if os.path.isfile(tmp_zip):
+            os.unlink(tmp_zip)
+    print(f"[setup] ffmpeg saved to {target}", file=sys.stderr)
+    return target
+
+
+def trim_media(path, start=None, end=None):
+    """Trim a video/audio file to [start, end] using ffmpeg.
+
+    Auto-downloads ffmpeg on first use if none is installed.
+    Returns path to a trimmed temp file (caller cleans up), or the
+    original path if no range was given.
+    """
+    if not start and not end:
+        return path
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        ffmpeg = download_ffmpeg()
+
+    ext = os.path.splitext(path)[1].lower()
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    tmp.close()
+
+    cmd = [ffmpeg, '-y', '-loglevel', 'error']
+    if start:
+        cmd += ['-ss', start]           # seek before input = fast seek
+    if end:
+        cmd += ['-to', end]
+    cmd += ['-i', path, '-c', 'copy', tmp.name]
+
+    try:
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        os.unlink(tmp.name)
+        err = e.stderr.decode(errors='replace')[:500]
+        raise RuntimeError(f"ffmpeg failed (exit {e.returncode}): {err}. "
+                           "Note: -c copy trims at keyframes; re-encode may "
+                           "be needed for exact cuts.") from e
+    return tmp.name
 
 
 # ----------------------------------------------------------- core logic ---
@@ -120,43 +204,6 @@ def build_content_part(path):
                      f"{sorted(SUPPORTED_EXTS)}")
 
 
-def trim_media(path, start=None, end=None):
-    """Trim a video/audio file to [start, end] using ffmpeg.
-
-    Returns path to a trimmed temp file (caller cleans up), or the
-    original path if no range was given.
-    """
-    if not start and not end:
-        return path
-
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("ffmpeg not found (looked in bin/ and PATH) — "
-                           "required for start/end trimming.")
-
-    ext = os.path.splitext(path)[1].lower()
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.close()
-
-    cmd = [ffmpeg, '-y', '-loglevel', 'error']
-    if start:
-        cmd += ['-ss', start]           # seek before input = fast seek
-    if end:
-        cmd += ['-to', end]
-    cmd += ['-i', path, '-c', 'copy', tmp.name]
-
-    try:
-        subprocess.run(cmd, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        os.unlink(tmp.name)
-        err = e.stderr.decode(errors='replace')[:500]
-        raise RuntimeError(f"ffmpeg failed (exit {e.returncode}): {err}. "
-                           "Note: -c copy trims at keyframes; re-encode may "
-                           "be needed for exact cuts.") from e
-    return tmp.name
-
-
 def build_payload(path, prompt, model=DEFAULT_MODEL):
     """Build the OpenRouter chat-completions request payload."""
     return {
@@ -179,16 +226,16 @@ def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
         path:   Path to a video/audio/PDF/image file.
         prompt: Instruction for the model (required).
         model:  OpenRouter model slug.
-        key:    API key; defaults to OR_KEY env var / .env file.
+        key:    API key; defaults to OR_KEY / OPENROUTER_API_KEY / .env.
         raw:    If True, return full API response dict instead of text.
         start:  Optional trim start ("30", "01:10", "00:01:10").
         end:    Optional trim end (same format).
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f'File not found: {path}')
-    key = key or get_key()
+    key = get_key(key)
     if not key:
-        raise RuntimeError('No API key: set OR_KEY in .env or environment')
+        raise RuntimeError(KEY_ERROR)
 
     trimmed = None
     try:
@@ -212,13 +259,100 @@ def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
             os.unlink(trimmed)
 
 
+# -------------------------------------------------------- list models ----
+
+def list_models(modality=None):
+    """Print OpenRouter models supporting the given input modality."""
+    with urllib.request.urlopen(MODELS_URL, timeout=60) as r:
+        data = json.loads(r.read())
+    rows = []
+    for m in data.get('data', []):
+        arch = m.get('architecture', {})
+        inputs = arch.get('input_modalities') or []
+        if modality and modality not in inputs:
+            continue
+        price = m.get('pricing', {}).get('prompt', '?')
+        try:
+            price = f"${float(price) * 1_000_000:.2f}/M"
+        except (TypeError, ValueError):
+            pass
+        rows.append((m['id'], ','.join(inputs), price))
+    rows.sort()
+    print(f"{'MODEL':<50} {'INPUTS':<25} PRICE")
+    for mid, inputs, price in rows:
+        print(f"{mid:<50} {inputs:<25} {price}")
+    print(f"\n{len(rows)} model(s)")
+
+
+# ------------------------------------------------------------ setup ------
+
+CLINE_SETTINGS = os.path.join(
+    os.environ.get('APPDATA', os.path.expanduser('~')),
+    'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev',
+    'settings', 'cline_mcp_settings.json')
+
+SERVER_NAME = 'ai-medialens'
+
+
+def cmd_setup():
+    """Interactive one-shot configuration: API key + Cline MCP registration."""
+    # --- 1. API key ---
+    env_path = os.path.join(SCRIPT_DIR, '.env')
+    if get_key():
+        print("[1/2] API key: already configured (OR_KEY / OPENROUTER_API_KEY "
+              "/ .env). Skipping.")
+    else:
+        key = input("Paste your OpenRouter key "
+                    "(get one at https://openrouter.ai/keys): ").strip()
+        if not key:
+            sys.exit("No key entered. Aborting.")
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write(f"OR_KEY={key}\n")
+        print(f"[1/2] API key saved to {env_path}")
+
+    # --- 2. Cline MCP registration ---
+    if not os.path.isfile(CLINE_SETTINGS):
+        print(f"[2/2] Cline settings not found at:\n  {CLINE_SETTINGS}\n"
+              "Add this manually to your mcpServers config:")
+        print(json.dumps({SERVER_NAME: _mcp_entry()}, indent=2))
+        return
+    with open(CLINE_SETTINGS, encoding='utf-8') as f:
+        settings = json.load(f)
+    servers = settings.setdefault('mcpServers', {})
+    if SERVER_NAME in servers:
+        print(f"[2/2] Cline MCP server '{SERVER_NAME}' already registered. "
+              "Skipping.")
+        return
+    ans = input(f"[2/2] Register '{SERVER_NAME}' in Cline's global MCP "
+                "config? [y/N]: ").strip().lower()
+    if ans == 'y':
+        servers[SERVER_NAME] = _mcp_entry()
+        with open(CLINE_SETTINGS, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2)
+        print(f"      Registered. Restart/reload Cline to activate.")
+    else:
+        print("      Skipped.")
+
+
+def _mcp_entry():
+    return {
+        "autoApprove": [],
+        "disabled": False,
+        "timeout": 300,
+        "type": "stdio",
+        "command": sys.executable,
+        "args": [os.path.join(SCRIPT_DIR, 'openrouter_media.py')],
+        "env": {},
+    }
+
+
 # ------------------------------------------------------------ MCP mode ----
 
 def mcp_run():
     """Run as an MCP stdio server (launched by Cline with no arguments)."""
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("aimedia")
+    mcp = FastMCP("ai-medialens")
 
     @mcp.tool()
     def analyze_media(path: str, prompt: str, model: str = DEFAULT_MODEL,
@@ -230,7 +364,8 @@ def mcp_run():
             prompt: Instruction for the model (e.g. transcribe, summarize).
             model: OpenRouter model slug.
             start: Optional trim start time ("30", "01:10", "00:01:10").
-            end: Optional trim end time (same format). Requires bundled ffmpeg.
+            end: Optional trim end time (same format). Requires ffmpeg
+                 (auto-downloaded on first use on Windows).
         """
         kwargs = {}
         if start:
@@ -246,20 +381,44 @@ def mcp_run():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Send video/audio/PDF/image to OpenRouter for analysis.")
-    ap.add_argument('file', help='Path to the media file')
-    ap.add_argument('-p', '--prompt', required=True,
-                    help='Instruction for the model')
+        prog="openrouter_media.py",
+        description="AI-MediaLens: send video/audio/PDF/image to OpenRouter "
+                    "for analysis (fills gaps Cline doesn't support).")
+    ap.add_argument('file', nargs='?', help='Path to the media file')
+    ap.add_argument('-p', '--prompt', help='Instruction for the model')
+    ap.add_argument('-k', '--key', default=None,
+                    help='OpenRouter API key (else OR_KEY / '
+                         'OPENROUTER_API_KEY / .env)')
     ap.add_argument('-m', '--model', default=DEFAULT_MODEL,
                     help=f'OpenRouter model (default: {DEFAULT_MODEL})')
     ap.add_argument('--start', default=None,
                     help='Trim start time, ffmpeg format '
-                         '(e.g. 30, 01:10, 00:01:10). Requires ffmpeg.')
+                         '(e.g. 30, 01:10, 00:01:10).')
     ap.add_argument('--end', default=None,
                     help='Trim end time (same format as --start).')
+    ap.add_argument('--list-models', nargs='?', const='all',
+                    metavar='MODALITY',
+                    help="List OpenRouter models, optionally filtered by "
+                         "input modality: video | audio | image | text")
     ap.add_argument('--dry-run', action='store_true',
                     help='Build the request and show its shape without sending')
     args = ap.parse_args(argv)
+
+    # Sub-command style helpers -----------------------------------------
+    if args.file == 'setup':
+        cmd_setup()
+        return
+
+    if args.list_models:
+        list_models(None if args.list_models == 'all' else args.list_models)
+        return
+
+    # Normal analysis flow -----------------------------------------------
+    if not args.file:
+        ap.error('the following arguments are required: file '
+                 '(or use "setup" / "--list-models")')
+    if not args.prompt:
+        ap.error('-p/--prompt is required')
 
     try:
         trimmed = trim_media(args.file, args.start, args.end)
@@ -283,6 +442,7 @@ def main(argv=None):
         else:
             try:
                 print(analyze(args.file, args.prompt, args.model,
+                              key=args.key,
                               start=args.start, end=args.end))
             except (RuntimeError, FileNotFoundError) as e:
                 sys.exit(str(e))

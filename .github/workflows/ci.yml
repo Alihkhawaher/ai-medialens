@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MCP dependency
+        run: pip install mcp
+
+      - name: Syntax check
+        run: python -m py_compile openrouter_media.py
+
+      - name: CLI help works
+        run: python openrouter_media.py --help
+
+      - name: Dry-run builds request without a key
+        run: |
+          echo "fake video content" > fake.mp4
+          python openrouter_media.py fake.mp4 -p "test" --dry-run
