@@ -366,10 +366,14 @@ def make_stt_chunks(path, chunk_sec=360):
     """
     tmpdir = tempfile.mkdtemp(prefix='aimedialens_stt_')
     pattern = os.path.join(tmpdir, 'chunk_%03d.opus')
-    # -vn strips video tracks so video files work directly
+    list_csv = os.path.join(tmpdir, 'chunks.csv')
+    # -vn strips video tracks so video files work directly.
+    # -segment_list writes exact start/end seconds per chunk — used to
+    # offset SRT timestamps across chunks.
     _run_ffmpeg(['-i', path, '-vn', '-ar', '16000', '-ac', '1',
                  '-c:a', 'libopus', '-b:a', '32k', '-application', 'voip',
                  '-f', 'segment', '-segment_time', str(chunk_sec),
+                 '-segment_list', list_csv, '-segment_list_type', 'csv',
                  '-reset_timestamps', '1', pattern])
 
     chunks = sorted(
@@ -390,7 +394,20 @@ def make_stt_chunks(path, chunk_sec=360):
             fixed.append(c)  # most STT APIs tolerate missing EOS
             if os.path.isfile(out):
                 os.unlink(out)
-    return fixed
+
+    # Chunk start times (seconds) for timestamp offsetting.
+    starts = []
+    try:
+        with open(list_csv, encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) >= 2:
+                    starts.append(float(parts[1]))
+    except (OSError, ValueError):
+        starts = [i * chunk_sec for i in range(len(chunks))]
+    while len(starts) < len(chunks):
+        starts.append(starts[-1] + chunk_sec)
+    return fixed, starts
 
 
 def cleanup_chunks(chunks):
@@ -445,7 +462,7 @@ def transcribe(path, model=DEFAULT_STT_MODEL, key=None, language=None,
     if not key:
         raise RuntimeError(KEY_ERROR)
 
-    chunks = make_stt_chunks(path)
+    chunks, starts = make_stt_chunks(path)
     texts, segments = [], []
     try:
         for i, chunk in enumerate(chunks):
@@ -478,8 +495,14 @@ def transcribe(path, model=DEFAULT_STT_MODEL, key=None, language=None,
 
             texts.append(result.get('text') or '')
             if srt and result.get('segments'):
-                offset = i * 360  # chunk length in seconds
-                segments.extend(result['segments'])
+                # Shift this chunk's segment times by its real start.
+                offset = starts[i] if i < len(starts) else i * 360
+                for seg in result['segments']:
+                    segments.append({
+                        'text': seg.get('text'),
+                        'start': seg.get('start', 0) + offset,
+                        'end': seg.get('end', 0) + offset,
+                    })
     finally:
         cleanup_chunks(chunks)
 
@@ -700,37 +723,30 @@ def main(argv=None):
     if not args.prompt:
         ap.error('-p/--prompt is required')
 
-    try:
-        trimmed = trim_media(args.file, args.start, args.end)
-    except (FileNotFoundError, RuntimeError) as e:
-        sys.exit(str(e))
-
-    try:
-        if args.dry_run:
-            try:
-                payload = build_payload(trimmed, args.prompt, args.model,
-                                        pdf_engine=args.pdf_engine)
-            except (FileNotFoundError, ValueError) as e:
-                sys.exit(str(e))
-            part = payload['messages'][0]['content'][0]
-            shape = {'type': part['type']}
-            for k, v in part.items():
-                if k != 'type':
-                    shape[k] = (list(v.keys()) if isinstance(v, dict)
-                                else f'<{len(str(v))} chars>')
-            print(json.dumps({'model': payload['model'],
-                              'content_part': shape}, indent=2))
-        else:
-            try:
-                print(analyze(args.file, args.prompt, args.model,
-                              key=args.key,
-                              start=args.start, end=args.end,
-                              pdf_engine=args.pdf_engine))
-            except (RuntimeError, FileNotFoundError) as e:
-                sys.exit(str(e))
-    finally:
-        if trimmed != args.file:
-            os.unlink(trimmed)
+    # Note: trimming happens inside analyze() — do NOT pre-trim here
+    # (that would run ffmpeg twice on the same file).
+    if args.dry_run:
+        try:
+            payload = build_payload(args.file, args.prompt, args.model,
+                                    pdf_engine=args.pdf_engine)
+        except (FileNotFoundError, ValueError) as e:
+            sys.exit(str(e))
+        part = payload['messages'][0]['content'][0]
+        shape = {'type': part['type']}
+        for k, v in part.items():
+            if k != 'type':
+                shape[k] = (list(v.keys()) if isinstance(v, dict)
+                            else f'<{len(str(v))} chars>')
+        print(json.dumps({'model': payload['model'],
+                          'content_part': shape}, indent=2))
+    else:
+        try:
+            print(analyze(args.file, args.prompt, args.model,
+                          key=args.key,
+                          start=args.start, end=args.end,
+                          pdf_engine=args.pdf_engine))
+        except (RuntimeError, FileNotFoundError) as e:
+            sys.exit(str(e))
 
 
 if __name__ == '__main__':
