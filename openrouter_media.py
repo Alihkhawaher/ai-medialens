@@ -46,7 +46,12 @@ DEFAULT_MODEL = 'qwen/qwen3.7-flash'
 # - mistral-ocr   : real OCR over page images — reads scanned PDFs
 #                   (billed per page by OpenRouter)
 # - native        : forward raw PDF to models with native file input
-PDF_ENGINES = ('cloudflare-ai', 'mistral-ocr', 'native')
+# Plus a fully LOCAL engine (no rate limits, no parsing cost):
+# - local         : PyMuPDF extracts the text layer locally; for scanned
+#                   PDFs (no text layer) pages are rendered to images and
+#                   the vision model performs the OCR itself.
+SERVER_PDF_ENGINES = ('cloudflare-ai', 'mistral-ocr', 'native')
+PDF_ENGINES = SERVER_PDF_ENGINES + ('local',)
 
 FFMPEG_URL = ('https://www.gyan.dev/ffmpeg/builds/'
               'ffmpeg-release-essentials.zip')
@@ -211,15 +216,50 @@ def build_content_part(path):
                      f"{sorted(SUPPORTED_EXTS)}")
 
 
+def pdf_local_content(path, max_pages=10):
+    """Parse a PDF locally with PyMuPDF into message content parts.
+
+    - Digital PDFs: extracted text is returned as a single text part.
+    - Scanned PDFs (no/embedded-empty text layer): pages are rendered to
+      PNG images so the vision model can read them directly (free OCR).
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        raise RuntimeError(
+            "Local PDF parsing requires PyMuPDF:\n  pip install pymupdf")
+
+    doc = fitz.open(path)
+    n_pages = min(doc.page_count, max_pages)
+    text = "\n".join(doc[i].get_text() for i in range(n_pages))
+
+    if len(text.strip()) >= 50 * max(n_pages, 1):
+        # Real text layer present — send it directly.
+        return [{"type": "text",
+                 "text": f"[Extracted PDF text, {n_pages} page(s)]\n{text}"}]
+
+    # Little/no text -> scanned document; render pages as images.
+    parts = []
+    for i in range(n_pages):
+        pix = doc[i].get_pixmap(dpi=110)
+        b64 = base64.b64encode(pix.tobytes("png")).decode()
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:image/png;base64,{b64}"}})
+    note = (f"[Scanned PDF, {n_pages} of {doc.page_count} page(s) rendered "
+            f"as images. Read them with OCR.]")
+    return parts + [{"type": "text", "text": note}]
+
+
 def build_payload(path, prompt, model=DEFAULT_MODEL, pdf_engine=None):
     """Build the OpenRouter chat-completions request payload.
 
     Args:
-        pdf_engine: Optional PDF parsing engine for OpenRouter's
-                    file-parser plugin. One of PDF_ENGINES, or None to
-                    use OpenRouter's own default.
+        pdf_engine: Optional SERVER-side PDF parsing engine for
+                    OpenRouter's file-parser plugin. One of
+                    SERVER_PDF_ENGINES, or None for OpenRouter's default.
+                    ('local' is handled separately in analyze().)
     """
-    if pdf_engine is not None and pdf_engine not in PDF_ENGINES:
+    if pdf_engine is not None and pdf_engine not in SERVER_PDF_ENGINES:
         raise ValueError(f"Invalid pdf_engine '{pdf_engine}'. "
                          f"Choose from: {PDF_ENGINES}")
     payload = {
@@ -262,8 +302,21 @@ def analyze(path, prompt, model=DEFAULT_MODEL, key=None, timeout=300,
     trimmed = None
     try:
         trimmed = trim_media(path, start, end)
-        payload = build_payload(trimmed, prompt, model,
-                                pdf_engine=pdf_engine)
+
+        is_pdf = os.path.splitext(trimmed)[1].lower() in PDF_EXTS
+        if pdf_engine == 'local' and is_pdf:
+            # Fully local parsing — bypasses OpenRouter's rate-limited
+            # file-parser entirely.
+            parts = pdf_local_content(trimmed)
+            payload = {
+                "model": model,
+                "messages": [{"role": "user",
+                              "content": parts +
+                                         [{"type": "text", "text": prompt}]}]
+            }
+        else:
+            payload = build_payload(trimmed, prompt, model,
+                                    pdf_engine=pdf_engine)
         req = urllib.request.Request(
             API_URL,
             data=json.dumps(payload).encode(),
@@ -390,9 +443,11 @@ def mcp_run():
             start: Optional trim start time ("30", "01:10", "00:01:10").
             end: Optional trim end time (same format). Requires ffmpeg
                  (auto-downloaded on first use on Windows).
-            pdf_engine: For PDFs only. Use 'mistral-ocr' for scanned/
-                image-only PDFs (real OCR, billed per page). Options:
-                cloudflare-ai | mistral-ocr | native. Empty = default parser.
+            pdf_engine: For PDFs only. 'local' parses locally with PyMuPDF
+                (no rate limits; renders scanned pages as images for the
+                vision model to OCR). Server-side options: cloudflare-ai |
+                mistral-ocr (real OCR for scans, billed per page) | native.
+                Empty = OpenRouter default parser.
         """
         kwargs = {}
         if start:

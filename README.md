@@ -105,13 +105,17 @@ releases as they appear.
 
 ## PDF parsing engines
 
-PDFs are parsed server-side by OpenRouter before reaching the model:
+PDFs are parsed either **locally** or server-side by OpenRouter:
 
 | Engine | Behavior | Cost |
 |---|---|---|
-| *(default)* | Text extraction from embedded text layer | Free |
-| `--pdf-engine mistral-ocr` | **Real OCR** over page images — required for scanned/image-only PDFs | Billed per page |
+| *(default)* | Server-side text extraction from embedded text layer | Free |
+| `--pdf-engine local` | **Local parsing via PyMuPDF** (`pip install pymupdf`) — no rate limits. Digital PDFs: text extracted locally. Scanned PDFs: pages rendered as images and the vision model performs the OCR itself | Free |
+| `--pdf-engine mistral-ocr` | Server-side real OCR over page images — reads scanned/image-only PDFs | Billed per page |
 | `--pdf-engine native` | Forward raw PDF to models with native file input | Free |
+
+`local` is recommended: it never hits OpenRouter's parser rate limits and
+handles both digital and scanned PDFs at zero extra cost.
 
 ## Notes
 

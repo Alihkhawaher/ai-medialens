@@ -1,2 +1,5 @@
 # Only needed for MCP mode (Cline integration)
 mcp>=1.0.0
+
+# Only needed for --pdf-engine local (local PDF parsing / scanned-PDF OCR)
+pymupdf>=1.24.0
