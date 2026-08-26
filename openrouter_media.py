@@ -70,6 +70,31 @@ IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
 
 SUPPORTED_EXTS = VIDEO_EXTS | AUDIO_EXTS | PDF_EXTS | IMAGE_EXTS
 
+# ------------------------------------------------------- TODO / roadmap ---
+# Known limitations & planned improvements (from full project review):
+#
+# 1. Tiny trailing chunks: ffmpeg's segment muxer can emit a very short
+#    final chunk (<30s) which some STT providers reject with 500.
+#    VidChatBox merges trailing chunks <50% of average size — port that
+#    merge logic into make_stt_chunks() if it ever bites.
+#
+# 2. --start/--end are silently ignored when --stt is used. Either
+#    support trimming before chunking, or print a warning.
+#
+# 3. Duration metadata: return media duration (via ffprobe) alongside
+#    results so harnesses can plan their own chunking loops.
+#
+# 4. Batch mode: analyze/transcribe multiple files in parallel using
+#    concurrent.futures with per-file progress reporting.
+#
+# 5. PDF result caching: hash the file and cache extracted text to avoid
+#    re-sending identical PDFs (saves tokens + parse latency).
+#
+# 6. CI: add an STT smoke test (mocked or --dry-run equivalent) so
+#    transcribe()/make_stt_chunks() regressions get caught.
+#
+# 7. Remove unused `import io`.
+
 
 # ---------------------------------------------------------------- .env ----
 
@@ -550,14 +575,22 @@ def cmd_setup():
     """Interactive one-shot configuration: API key + Cline MCP registration."""
     # --- 1. API key ---
     env_path = os.path.join(SCRIPT_DIR, '.env')
+    key = None
     if get_key():
         print("[1/2] API key: already configured (OR_KEY / OPENROUTER_API_KEY "
-              "/ .env). Skipping.")
+              "/ .env).")
+        ans = input("      Update/replace it? [y/N]: ").strip().lower()
+        if ans == 'y':
+            key = input("Paste your new OpenRouter key "
+                        "(get one at https://openrouter.ai/keys): ").strip()
+            if not key:
+                print("      No key entered — keeping existing key.")
     else:
         key = input("Paste your OpenRouter key "
                     "(get one at https://openrouter.ai/keys): ").strip()
         if not key:
             sys.exit("No key entered. Aborting.")
+    if key:
         with open(env_path, 'w', encoding='utf-8') as f:
             f.write(f"OR_KEY={key}\n")
         print(f"[1/2] API key saved to {env_path}")
